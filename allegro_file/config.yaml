@@ -1,0 +1,150 @@
+# ================== 顶层配置 ==================
+run: [train, test]
+
+cutoff_radius: 6.0
+chemical_symbols: [C, H, O, F]
+model_type_names: ${chemical_symbols}
+monitored_metric: val0_epoch/weighted_sum
+
+global_options:
+  allow_tf32: false
+
+# ================== 数据部分 ==================
+data:
+  _target_: nequip.data.datamodule.ASEDataModule
+
+  # 用一个 extxyz 文件，并在内部按比例划分 train / val / test
+  split_dataset:
+    file_path: ./merged.extxyz    # 和 input.yaml 在同一目录
+    train: 0.8
+    val: 0.1
+    test: 0.1
+
+  seed: 123   # 数据随机种子
+
+  # 邻居列表 + 原子类型映射（新版本接口）
+  transforms:
+    - _target_: nequip.data.transforms.NeighborListTransform
+      r_max: ${cutoff_radius}
+
+    - _target_: nequip.data.transforms.ChemicalSpeciesToAtomTypeMapper
+      model_type_names: ${model_type_names}
+      chemical_species_to_atom_type_map: ${list_to_identity_dict:${chemical_symbols}}
+
+  # dataloader 设置
+  train_dataloader:
+    _target_: torch.utils.data.DataLoader
+    batch_size: 4
+    num_workers: 4
+
+  val_dataloader:
+    _target_: torch.utils.data.DataLoader
+    batch_size: 4
+    num_workers: 4
+
+  test_dataloader: ${data.val_dataloader}
+
+  # 统计量，用于 energy shift / scale 等
+  stats_manager:
+    _target_: nequip.data.CommonDataStatisticsManager
+    type_names: ${model_type_names}
+
+# ================== Trainer（Lightning） ==================
+trainer:
+  _target_: lightning.Trainer
+  accelerator: gpu
+  devices: 1                 # 单 GPU（多 GPU 再一起改）
+  max_epochs: 1000
+  check_val_every_n_epoch: 1
+
+  callbacks:
+    - _target_: lightning.pytorch.callbacks.EarlyStopping
+      monitor: ${monitored_metric}
+      min_delta: 1.0e-5
+      patience: 50
+
+    - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+      monitor: ${monitored_metric}
+      dirpath: ${hydra:runtime.output_dir}
+      filename: best
+      save_last: true
+
+    - _target_: lightning.pytorch.callbacks.LearningRateMonitor
+      logging_interval: epoch
+
+  logger:
+    - _target_: lightning.pytorch.loggers.CSVLogger
+      save_dir: ${hydra:runtime.output_dir}
+      name: csv_log
+
+# ================== Training module（含 Allegro model） ==================
+training_module:
+  _target_: nequip.train.EMALightningModule
+  ema_decay: 0.999
+
+  # ---- Loss ----
+  loss:
+    _target_: nequip.train.EnergyForceLoss
+    per_atom_energy: true
+    coeffs:
+      total_energy: 1.0   # 这里假设 extxyz 里的能量字段名为 total_energy
+      forces: 5.0         # 强调力
+
+  # ---- Metrics ----
+  val_metrics:
+    _target_: nequip.train.EnergyForceMetrics
+    coeffs:
+      per_atom_energy_mae: 1.0
+      forces_mae: 1.0
+
+  train_metrics: ${training_module.val_metrics}
+  test_metrics: ${training_module.val_metrics}
+
+  # ---- Optimizer ----
+  optimizer:
+    _target_: torch.optim.Adam
+    lr: 0.003
+
+  # ---- LR scheduler ----
+  lr_scheduler:
+    scheduler:
+      _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
+      factor: 0.6
+      patience: 10
+      threshold: 0.2
+      min_lr: 1.0e-6
+    monitor: ${monitored_metric}
+    interval: epoch
+    frequency: 1
+
+  # ---- Allegro 模型本体 ----
+  model:
+    _target_: allegro.model.AllegroModel
+
+    # —— 必须参数 ——
+    seed: 123
+    model_dtype: float32
+    type_names: ${model_type_names}
+    r_max: ${cutoff_radius}
+
+    # —— Allegro 结构超参数 ——
+    num_layers: 2
+    l_max: 1
+    parity: true
+    num_scalar_features: 64
+    num_tensor_features: 16
+
+    # —— 这里用 radial_chemical_embed，而不是 scalar_embed ——
+    radial_chemical_embed:
+      _target_: allegro.nn.TwoBodyBesselScalarEmbed
+      num_bessels: 8
+      bessel_trainable: false
+      polynomial_cutoff_p: 6
+
+    # 利用统计量做能量 shift / scale
+    avg_num_neighbors: ${training_data_stats:num_neighbors_mean}
+    per_type_energy_shifts: ${training_data_stats:per_atom_energy_mean}
+    per_type_energy_scales: ${training_data_stats:forces_rms}
+    per_type_energy_scales_trainable: false
+    per_type_energy_shifts_trainable: false
+
